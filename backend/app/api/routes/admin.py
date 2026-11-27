@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import require_admin
 from app.core.security import hash_password
 from app.db.session import get_db
+from app.dependencies.user_dependencies import get_user_service
 from app.models.user import User, UserRole
 from app.schemas.user import (
     AdminUserCreate,
@@ -12,17 +13,13 @@ from app.schemas.user import (
     DashboardStats,
     UserOut,
 )
+from app.services.user_service import UserService
 from app.tasks.celery_app import celery_app
 from app.tasks.tasks import send_welcome_email
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
 
-def get_user_or_404(db: Session, user_id: int) -> User:
-    user = db.query(User).filter(User.id == user_id).first()
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    return user
 
 
 def protect_last_admin(db: Session, target: User, removing_admin_access: bool) -> None:
@@ -88,10 +85,10 @@ def list_users(
 @router.get("/users/{user_id}", response_model=UserOut)
 def get_user(
     user_id: int,
-    db: Session = Depends(get_db),
+    user_service: UserService = Depends(get_user_service),
     _: User = Depends(require_admin),
 ):
-    return get_user_or_404(db, user_id)
+    return user_service.get_user_or_404(user_id)
 
 
 @router.post("/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
