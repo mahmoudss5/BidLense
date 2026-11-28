@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import require_admin
 from app.core.security import hash_password
 from app.db.session import get_db
+from app.dependencies.user_dependencies import get_user_service
 from app.models.user import User, UserRole
 from app.schemas.user import (
     AdminUserCreate,
@@ -12,17 +13,13 @@ from app.schemas.user import (
     DashboardStats,
     UserOut,
 )
+from app.services.user_service import UserService
 from app.tasks.celery_app import celery_app
 from app.tasks.tasks import send_welcome_email
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
 
-def get_user_or_404(db: Session, user_id: int) -> User:
-    user = db.query(User).filter(User.id == user_id).first()
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    return user
 
 
 def protect_last_admin(db: Session, target: User, removing_admin_access: bool) -> None:
@@ -88,10 +85,10 @@ def list_users(
 @router.get("/users/{user_id}", response_model=UserOut)
 def get_user(
     user_id: int,
-    db: Session = Depends(get_db),
+    user_service: UserService = Depends(get_user_service),
     _: User = Depends(require_admin),
 ):
-    return get_user_or_404(db, user_id)
+    return user_service.get_user_or_404(user_id)
 
 
 @router.post("/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
@@ -123,76 +120,20 @@ def update_user(
     payload: AdminUserUpdate,
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service)
 ):
-    target = get_user_or_404(db, user_id)
-    changes = payload.model_dump(exclude_unset=True, exclude_none=True)
+    return user_service.admin_update_user(user_id, payload, admin)
 
-    if not changes:
-        raise HTTPException(status_code=400, detail="No changes provided")
-
-    if target.id == admin.id:
-        removing_own_admin_access = (
-            changes.get("role") == UserRole.USER
-            or changes.get("is_active") is False
-        )
-        if removing_own_admin_access:
-            raise HTTPException(
-                status_code=400,
-                detail="You cannot demote or deactivate your own admin account",
-            )
-
-    new_role = changes.get("role", UserRole(target.role))
-    new_is_active = changes.get("is_active", target.is_active)
-    removing_admin_access = (
-        target.role == UserRole.ADMIN.value
-        and target.is_active
-        and (new_role == UserRole.USER or not new_is_active)
-    )
-    protect_last_admin(db, target, removing_admin_access)
-
-    if "email" in changes:
-        email = str(changes["email"]).lower()
-        duplicate = (
-            db.query(User)
-            .filter(User.email == email, User.id != target.id)
-            .first()
-        )
-        if duplicate:
-            raise HTTPException(status_code=409, detail="Email is already in use")
-        target.email = email
-
-    if "full_name" in changes:
-        target.full_name = changes["full_name"].strip()
-    if "password" in changes:
-        target.hashed_password = hash_password(changes["password"])
-    if "role" in changes:
-        target.role = changes["role"].value
-    if "is_active" in changes:
-        target.is_active = changes["is_active"]
-
-    db.commit()
-    db.refresh(target)
-    return target
 
 
 @router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_user(
     user_id: int,
     db: Session = Depends(get_db),
+    user_service: UserService = Depends(get_user_service),
     admin: User = Depends(require_admin),
 ):
-    target = get_user_or_404(db, user_id)
-
-    if target.id == admin.id:
-        raise HTTPException(status_code=400, detail="You cannot delete your own admin account")
-
-    removing_admin_access = (
-        target.role == UserRole.ADMIN.value and target.is_active
-    )
-    protect_last_admin(db, target, removing_admin_access)
-
-    db.delete(target)
-    db.commit()
+    user_service.delete_user(user_id)
     return None
 
 
@@ -201,8 +142,9 @@ def queue_welcome_email(
     user_id: int,
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
+    user_service: UserService = Depends(get_user_service),
 ):
-    target = get_user_or_404(db, user_id)
+    target = user_service.get_user_or_404(user_id)
     try:
         task = send_welcome_email.delay(target.id, target.email)
     except Exception as exc:
